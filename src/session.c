@@ -1757,6 +1757,12 @@ struct task *process_session(struct task *t)
 		/* note: maybe we should process connection errors here ? */
 	}
 
+	if (unlikely((s->rep->flags & CF_AUTO_CLOSE) &&
+		     (s->rep->flags & CF_WROTE_DATA) &&
+		     (s->txn.status == -1))) {
+		http_notify_timeout(s, s->rep);
+	}
+
 	if (s->si[1].state == SI_ST_CON) {
 		/* we were trying to establish a connection on the server side,
 		 * maybe it succeeded, maybe it failed, maybe we timed out, ...
