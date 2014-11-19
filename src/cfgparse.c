@@ -2003,7 +2003,6 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		curproxy->no_options = defproxy.no_options;
 		curproxy->no_options2 = defproxy.no_options2;
 		curproxy->bind_proc = defproxy.bind_proc;
-		curproxy->lbprm.algo = defproxy.lbprm.algo;
 		curproxy->except_net = defproxy.except_net;
 		curproxy->except_mask = defproxy.except_mask;
 		curproxy->except_to = defproxy.except_to;
@@ -2037,6 +2036,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		}
 
 		if (curproxy->cap & PR_CAP_BE) {
+			curproxy->lbprm.algo = defproxy.lbprm.algo;
 			curproxy->fullconn = defproxy.fullconn;
 			curproxy->conn_retries = defproxy.conn_retries;
 			curproxy->max_ka_queue = defproxy.max_ka_queue;
@@ -6015,6 +6015,8 @@ void propagate_processes(struct proxy *from, struct proxy *to)
 
 	/* use_backend */
 	list_for_each_entry(rule, &from->switching_rules, list) {
+		if (rule->dynamic)
+			continue;
 		to = rule->be.backend;
 		propagate_processes(from, to);
 	}
@@ -6102,7 +6104,6 @@ int check_config_validity()
 		if (curproxy->state == PR_STSTOPPED) {
 			/* ensure we don't keep listeners uselessly bound */
 			stop_proxy(curproxy);
-			curproxy = curproxy->next;
 			continue;
 		}
 
@@ -7112,10 +7113,14 @@ out_uri_auth_compat:
 			global.stats_fe->bind_proc = ~0UL;
 	}
 
-	/* propagate bindings from frontends to backends */
-	for (curproxy = proxy; curproxy; curproxy = curproxy->next) {
-		if (curproxy->cap & PR_CAP_FE)
-			propagate_processes(curproxy, NULL);
+	/* propagate bindings from frontends to backends. Don't do it if there
+	 * are any fatal errors as we must not call it with unresolved proxies.
+	 */
+	if (!cfgerr) {
+		for (curproxy = proxy; curproxy; curproxy = curproxy->next) {
+			if (curproxy->cap & PR_CAP_FE)
+				propagate_processes(curproxy, NULL);
+		}
 	}
 
 	/* Bind each unbound backend to all processes when not specified. */

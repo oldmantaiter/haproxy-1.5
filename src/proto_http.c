@@ -2393,6 +2393,59 @@ fail:
 	return 0;
 }
 
+void http_adjust_conn_mode(struct session *s, struct http_txn *txn, struct http_msg *msg)
+{
+	int tmp = TX_CON_WANT_KAL;
+
+	if (!((s->fe->options2|s->be->options2) & PR_O2_FAKE_KA)) {
+		if ((s->fe->options & PR_O_HTTP_MODE) == PR_O_HTTP_TUN ||
+		    (s->be->options & PR_O_HTTP_MODE) == PR_O_HTTP_TUN)
+			tmp = TX_CON_WANT_TUN;
+
+		if ((s->fe->options & PR_O_HTTP_MODE) == PR_O_HTTP_PCL ||
+		    (s->be->options & PR_O_HTTP_MODE) == PR_O_HTTP_PCL)
+			tmp = TX_CON_WANT_TUN;
+	}
+
+	if ((s->fe->options & PR_O_HTTP_MODE) == PR_O_HTTP_SCL ||
+	    (s->be->options & PR_O_HTTP_MODE) == PR_O_HTTP_SCL) {
+		/* option httpclose + server_close => forceclose */
+		if ((s->fe->options & PR_O_HTTP_MODE) == PR_O_HTTP_PCL ||
+		    (s->be->options & PR_O_HTTP_MODE) == PR_O_HTTP_PCL)
+			tmp = TX_CON_WANT_CLO;
+		else
+			tmp = TX_CON_WANT_SCL;
+	}
+
+	if ((s->fe->options & PR_O_HTTP_MODE) == PR_O_HTTP_FCL ||
+	    (s->be->options & PR_O_HTTP_MODE) == PR_O_HTTP_FCL)
+		tmp = TX_CON_WANT_CLO;
+
+	if ((txn->flags & TX_CON_WANT_MSK) < tmp)
+		txn->flags = (txn->flags & ~TX_CON_WANT_MSK) | tmp;
+
+	if (!(txn->flags & TX_HDR_CONN_PRS) &&
+	    (txn->flags & TX_CON_WANT_MSK) != TX_CON_WANT_TUN) {
+		/* parse the Connection header and possibly clean it */
+		int to_del = 0;
+		if ((msg->flags & HTTP_MSGF_VER_11) ||
+		    ((txn->flags & TX_CON_WANT_MSK) >= TX_CON_WANT_SCL &&
+		     !((s->fe->options2|s->be->options2) & PR_O2_FAKE_KA)))
+			to_del |= 2; /* remove "keep-alive" */
+		if (!(msg->flags & HTTP_MSGF_VER_11))
+			to_del |= 1; /* remove "close" */
+		http_parse_connection_header(txn, msg, to_del);
+	}
+
+	/* check if client or config asks for explicit close in KAL/SCL */
+	if (((txn->flags & TX_CON_WANT_MSK) == TX_CON_WANT_KAL ||
+	     (txn->flags & TX_CON_WANT_MSK) == TX_CON_WANT_SCL) &&
+	    ((txn->flags & TX_HDR_CONN_CLO) ||                         /* "connection: close" */
+	     (!(msg->flags & HTTP_MSGF_VER_11) && !(txn->flags & TX_HDR_CONN_KAL)) || /* no "connection: k-a" in 1.0 */
+	     !(msg->flags & HTTP_MSGF_XFER_LEN) ||                     /* no length known => close */
+	     s->fe->state == PR_STSTOPPED))                            /* frontend is stopping */
+		txn->flags = (txn->flags & ~TX_CON_WANT_MSK) | TX_CON_WANT_CLO;
+}
 
 /* This stream analyser waits for a complete HTTP request. It returns 1 if the
  * processing can continue on next analysers, or zero if it either needs more
@@ -2493,7 +2546,7 @@ int http_wait_for_request(struct session *s, struct channel *req, int an_bit)
 	/* 1: we might have to print this header in debug mode */
 	if (unlikely((global.mode & MODE_DEBUG) &&
 		     (!(global.mode & MODE_QUIET) || (global.mode & MODE_VERBOSE)) &&
-		     (msg->msg_state >= HTTP_MSG_BODY || msg->msg_state == HTTP_MSG_ERROR))) {
+		     msg->msg_state >= HTTP_MSG_BODY)) {
 		char *eol, *sol;
 
 		sol = req->buf->p;
@@ -2929,58 +2982,8 @@ int http_wait_for_request(struct session *s, struct channel *req, int an_bit)
 	 * time.
 	 */
 	if (!(txn->flags & TX_HDR_CONN_PRS) ||
-	    ((s->fe->options & PR_O_HTTP_MODE) != (s->be->options & PR_O_HTTP_MODE))) {
-		int tmp = TX_CON_WANT_KAL;
-
-		if (!((s->fe->options2|s->be->options2) & PR_O2_FAKE_KA)) {
-			if ((s->fe->options & PR_O_HTTP_MODE) == PR_O_HTTP_TUN ||
-			    (s->be->options & PR_O_HTTP_MODE) == PR_O_HTTP_TUN)
-				tmp = TX_CON_WANT_TUN;
-
-			if ((s->fe->options & PR_O_HTTP_MODE) == PR_O_HTTP_PCL ||
-			    (s->be->options & PR_O_HTTP_MODE) == PR_O_HTTP_PCL)
-				tmp = TX_CON_WANT_TUN;
-		}
-
-		if ((s->fe->options & PR_O_HTTP_MODE) == PR_O_HTTP_SCL ||
-		    (s->be->options & PR_O_HTTP_MODE) == PR_O_HTTP_SCL) {
-			/* option httpclose + server_close => forceclose */
-			if ((s->fe->options & PR_O_HTTP_MODE) == PR_O_HTTP_PCL ||
-			    (s->be->options & PR_O_HTTP_MODE) == PR_O_HTTP_PCL)
-				tmp = TX_CON_WANT_CLO;
-			else
-				tmp = TX_CON_WANT_SCL;
-		}
-
-		if ((s->fe->options & PR_O_HTTP_MODE) == PR_O_HTTP_FCL ||
-		    (s->be->options & PR_O_HTTP_MODE) == PR_O_HTTP_FCL)
-			tmp = TX_CON_WANT_CLO;
-
-		if ((txn->flags & TX_CON_WANT_MSK) < tmp)
-			txn->flags = (txn->flags & ~TX_CON_WANT_MSK) | tmp;
-
-		if (!(txn->flags & TX_HDR_CONN_PRS) &&
-		    (txn->flags & TX_CON_WANT_MSK) != TX_CON_WANT_TUN) {
-			/* parse the Connection header and possibly clean it */
-			int to_del = 0;
-			if ((msg->flags & HTTP_MSGF_VER_11) ||
-			    ((txn->flags & TX_CON_WANT_MSK) >= TX_CON_WANT_SCL &&
-			     !((s->fe->options2|s->be->options2) & PR_O2_FAKE_KA)))
-				to_del |= 2; /* remove "keep-alive" */
-			if (!(msg->flags & HTTP_MSGF_VER_11))
-				to_del |= 1; /* remove "close" */
-			http_parse_connection_header(txn, msg, to_del);
-		}
-
-		/* check if client or config asks for explicit close in KAL/SCL */
-		if (((txn->flags & TX_CON_WANT_MSK) == TX_CON_WANT_KAL ||
-		     (txn->flags & TX_CON_WANT_MSK) == TX_CON_WANT_SCL) &&
-		    ((txn->flags & TX_HDR_CONN_CLO) ||                         /* "connection: close" */
-		     (!(msg->flags & HTTP_MSGF_VER_11) && !(txn->flags & TX_HDR_CONN_KAL)) || /* no "connection: k-a" in 1.0 */
-		     !(msg->flags & HTTP_MSGF_XFER_LEN) ||                     /* no length known => close */
-		     s->fe->state == PR_STSTOPPED))                            /* frontend is stopping */
-		    txn->flags = (txn->flags & ~TX_CON_WANT_MSK) | TX_CON_WANT_CLO;
-	}
+	    ((s->fe->options & PR_O_HTTP_MODE) != (s->be->options & PR_O_HTTP_MODE)))
+		http_adjust_conn_mode(s, txn, msg);
 
 	/* end of job, return OK */
 	req->analysers &= ~an_bit;
@@ -4890,6 +4893,7 @@ void http_end_txn_clean_session(struct session *s)
 	s->rep->flags &= ~(CF_SHUTR|CF_SHUTR_NOW|CF_READ_ATTACHED|CF_READ_ERROR|CF_READ_NOEXP|CF_STREAMER|CF_STREAMER_FAST|CF_WRITE_PARTIAL|CF_NEVER_WAIT|CF_WROTE_DATA);
 	s->flags &= ~(SN_DIRECT|SN_ASSIGNED|SN_ADDR_SET|SN_BE_ASSIGNED|SN_FORCE_PRST|SN_IGNORE_PRST);
 	s->flags &= ~(SN_CURR_SESS|SN_REDIRECTABLE|SN_SRV_REUSED);
+	s->flags &= ~(SN_ERR_MASK|SN_FINST_MASK|SN_REDISP);
 
 	s->txn.meth = 0;
 	http_reset_txn(s);
@@ -5658,7 +5662,7 @@ int http_wait_for_response(struct session *s, struct channel *rep, int an_bit)
 	/* 1: we might have to print this header in debug mode */
 	if (unlikely((global.mode & MODE_DEBUG) &&
 		     (!(global.mode & MODE_QUIET) || (global.mode & MODE_VERBOSE)) &&
-		     (msg->msg_state >= HTTP_MSG_BODY || msg->msg_state == HTTP_MSG_ERROR))) {
+		     msg->msg_state >= HTTP_MSG_BODY)) {
 		char *eol, *sol;
 
 		sol = rep->buf->p;
