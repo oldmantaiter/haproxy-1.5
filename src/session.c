@@ -788,10 +788,11 @@ static int sess_update_st_con_tcp(struct session *s, struct stream_interface *si
 	// 	// Avoid any closing of the client side session yet and lets get this down to the errorfile to keep the session pumping
 	// 	return 1;
 	// }
-
-	if (unlikely(si->flags & (SI_FL_EXP|SI_FL_ERR))) {
-		if (unlikely(si->ob->flags & CF_WRITE_PARTIAL) ||
-			unlikely(si->flags & SI_FL_EXP)) {
+	if (unlikely(si->flags & SI_FL_ERR)) {
+		sess_abort_conn_failures(s, s->rep, &s->txn, srv);
+		return 1;
+	} else if (unlikely(si->flags & SI_FL_ERR)) {
+		if (unlikely(si->ob->flags & CF_WRITE_PARTIAL)) {
 			/* Some data were sent past the connection establishment,
 			 * so we need to pretend we're established to log correctly
 			 * and let later states handle the failure.
