@@ -770,14 +770,28 @@ static int sess_update_st_con_tcp(struct session *s, struct stream_interface *si
 {
 	struct channel *req = si->ob;
 	struct channel *rep = si->ib;
+	// struct http_txn *txn = &s->txn;
 	struct connection *srv_conn = __objt_conn(si->end);
 
 	/* If we got an error, or if nothing happened and the connection timed
 	 * out, we must give up. The CER state handler will take care of retry
 	 * attempts and error reports.
 	 */
+
+	/* note: if there are no retries, or the session is not set to retry, lets fire back loaded requests */
+	// if (unlikely(si->flags & (SI_FL_EXP|SI_FL_ERR)) && si->conn_retries == 0) {
+	// 	qfprintf(stderr, "In sess_update_st_con error condition\n");
+	// 	si->state		= SI_ST_EST;
+	// 	si->err_type	= SI_ET_DATA_ERR;
+	// 	si->ib->flags	|= CF_READ_ERROR | CF_WRITE_ERROR;
+	// 	txn->flags &= ~TX_NOT_FIRST;
+	// 	// Avoid any closing of the client side session yet and lets get this down to the errorfile to keep the session pumping
+	// 	return 1;
+	// }
+
 	if (unlikely(si->flags & (SI_FL_EXP|SI_FL_ERR))) {
-		if (unlikely(si->ob->flags & CF_WRITE_PARTIAL)) {
+		if (unlikely(si->ob->flags & CF_WRITE_PARTIAL) ||
+			unlikely(si->flags & SI_FL_EXP)) {
 			/* Some data were sent past the connection establishment,
 			 * so we need to pretend we're established to log correctly
 			 * and let later states handle the failure.
@@ -787,6 +801,7 @@ static int sess_update_st_con_tcp(struct session *s, struct stream_interface *si
 			si->ib->flags |= CF_READ_ERROR | CF_WRITE_ERROR;
 			return 1;
 		}
+
 		si->exp   = TICK_ETERNITY;
 		si->state = SI_ST_CER;
 
@@ -1620,6 +1635,26 @@ static int process_store_rules(struct session *s, struct channel *rep, int an_bi
 			continue;					\
 }
 
+/* This session is going to abort the txn in a sane way (I hope) */
+
+static void sess_abort_conn_failures(struct session *s, struct channel *rep, struct http_txn *txn, struct server *srv) {
+	s->be->be_counters.failed_resp++;
+	if (srv)
+		srv->counters.failed_resp++;
+	if (!(s->flags & SN_ERR_MASK))
+		s->flags |= SN_ERR_SRVCL;
+	if (!(s->flags & SN_FINST_MASK))
+		s->flags |= SN_FINST_D;
+
+	channel_auto_close(rep);
+	rep->analysers = 0;
+	s->req->analysers = 0;
+	txn->status = 504;
+	rep->prod->flags |= SI_FL_NOLINGER;
+	bi_erase(rep);
+	stream_int_retnclose(rep->cons, http_error_message(s, HTTP_ERR_504));
+}
+
 /* Processes the client, server, request and response jobs of a session task,
  * then puts it back to the wait queue in a clean state, or cleans up its
  * resources if it must be deleted. Returns in <next> the date the task wants
@@ -1735,25 +1770,43 @@ struct task *process_session(struct task *t)
 		}
 	}
 
-	if (unlikely(s->si[1].flags & SI_FL_ERR)) {
-		if (s->si[1].state == SI_ST_EST || s->si[1].state == SI_ST_DIS) {
-			si_shutr(&s->si[1]);
-			si_shutw(&s->si[1]);
-			stream_int_report_error(&s->si[1]);
-			s->be->be_counters.failed_resp++;
-			if (srv)
-				srv->counters.failed_resp++;
-			if (!(s->req->analysers) && !(s->rep->analysers)) {
-				s->be->be_counters.srv_aborts++;
-				s->fe->fe_counters.srv_aborts++;
-				if (srv)
-					srv->counters.srv_aborts++;
-				if (!(s->flags & SN_ERR_MASK))
-					s->flags |= SN_ERR_SRVCL;
-				if (!(s->flags & SN_FINST_MASK))
-					s->flags |= SN_FINST_D;
-			}
-		}
+	/* Here is where we process server error requests. I'm going to stop it from shutting things down */
+
+	if (unlikely(s->si[1].flags & (SI_FL_ERR))) {
+		if (s->si[1].state == SI_ST_EST || s-> si[1].state == SI_ST_DIS)
+			sess_abort_conn_failures(s, s->rep, &s->txn, srv);
+		// if (srv_conn->conn_retries == 0) {
+		// 	qfprintf(stderr, "No more retries.\n");
+		// 	s->be->be_counters.failed_resp++;
+		// 	if (srv)
+		// 		srv->counters.failed_resp++;
+		// 	if (!(s->flags & SN_ERR_MASK))
+		// 		s->flags |= SN_ERR_SRVCL;
+		// 	if (!(s->flags & SN_FINST_MASK))
+		// 		s->flags |= SN_FINST_D;
+		// 	// si->state		= SI_ST_EST;
+		// 	srv_conn->err_type	= SI_ET_DATA_ERR;
+		// 	srv_conn->ib->flags	|= CF_READ_ERROR | CF_WRITE_ERROR;
+		// 	txn->flags &= ~TX_NOT_FIRST;
+		// } else 
+		// if (s->si[1].state == SI_ST_EST || s->si[1].state == SI_ST_DIS) {
+		// 	si_shutr(&s->si[1]);
+		// 	si_shutw(&s->si[1]);
+		// 	stream_int_report_error(&s->si[1]);
+		// 	s->be->be_counters.failed_resp++;
+		// 	if (srv)
+		// 		srv->counters.failed_resp++;
+		// 	if (!(s->req->analysers) && !(s->rep->analysers)) {
+		// 		s->be->be_counters.srv_aborts++;
+		// 		s->fe->fe_counters.srv_aborts++;
+		// 		if (srv)
+		// 			srv->counters.srv_aborts++;
+		// 		if (!(s->flags & SN_ERR_MASK))
+		// 			s->flags |= SN_ERR_SRVCL;
+		// 		if (!(s->flags & SN_FINST_MASK))
+		// 			s->flags |= SN_FINST_D;
+		// 	}
+		// } 
 		/* note: maybe we should process connection errors here ? */
 	}
 

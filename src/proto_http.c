@@ -5570,6 +5570,9 @@ int http_request_forward_body(struct session *s, struct channel *req, int an_bit
 	if (txn->status) {
 		/* Note: we don't send any error if some data were already sent */
 		stream_int_retnclose(req->prod, NULL);
+	} else if (txn->status == -1) {
+		txn->status = 504;
+		stream_int_retnclose(req->prod, http_error_message(s, HTTP_ERR_504));
 	} else {
 		txn->status = 502;
 		stream_int_retnclose(req->prod, http_error_message(s, HTTP_ERR_502));
@@ -6150,7 +6153,7 @@ skip_content_length:
 	 * The client is required to retry. We need to close without returning
 	 * any other information so that the client retries.
 	 */
-	txn->status = 0;
+	txn->status = 504;
 	rep->analysers = 0;
 	s->req->analysers = 0;
 	channel_auto_close(rep);
@@ -6158,7 +6161,7 @@ skip_content_length:
 	s->logs.level = 0;
 	s->rep->flags &= ~CF_EXPECT_MORE; /* speed up sending a previous response */
 	bi_erase(rep);
-	stream_int_retnclose(rep->cons, NULL);
+	stream_int_retnclose(rep->cons, http_error_message(s, HTTP_ERR_504));
 	return 0;
 }
 
